@@ -15,6 +15,7 @@ from ultralytics import YOLO
 from config import *
 from camera import open_camera
 from timesformer_adapter import TimeSformerAdapter
+from alert_manager import AlertManager
 
 
 # =====================================================
@@ -33,7 +34,6 @@ print("CPU threads:", torch.get_num_threads())
 # =====================================================
 
 stop_event = threading.Event()
-
 results_lock = threading.Lock()
 
 latest_results = {
@@ -59,12 +59,10 @@ weapon_queue = queue.Queue(maxsize=1)
 
 
 def put_latest(q, item):
-
     try:
         q.put_nowait(item)
 
     except queue.Full:
-
         try:
             q.get_nowait()
         except queue.Empty:
@@ -81,21 +79,17 @@ def put_latest(q, item):
 # =====================================================
 
 def update_result(name, result):
-
     with results_lock:
         latest_results[name] = result
 
 
 def update_status(name, status):
-
     with results_lock:
         model_status[name] = status
 
 
 def get_results():
-
     with results_lock:
-
         return (
             dict(latest_results),
             dict(model_status)
@@ -109,7 +103,6 @@ def get_results():
 def timesformer_worker():
 
     try:
-
         model = TimeSformerAdapter()
 
         update_status("timesformer", "Running")
@@ -117,19 +110,13 @@ def timesformer_worker():
         print("[TimeSformer] Worker started.")
 
     except Exception as error:
-
-        update_status(
-            "timesformer",
-            f"ERROR: {error}"
-        )
-
+        update_status("timesformer", f"ERROR: {error}")
         print("[TimeSformer ERROR]", error)
         return
 
     while not stop_event.is_set():
 
         try:
-
             clip, timestamp, submitted_at = (
                 timesformer_queue.get(timeout=0.2)
             )
@@ -138,7 +125,6 @@ def timesformer_worker():
             continue
 
         try:
-
             prediction = model.predict(clip)
 
             result = {
@@ -162,7 +148,6 @@ def timesformer_worker():
             )
 
         except Exception as error:
-
             print("[TimeSformer ERROR]", error)
 
 
@@ -173,7 +158,6 @@ def timesformer_worker():
 def pose_worker():
 
     try:
-
         if not POSE_PATH.exists():
             raise FileNotFoundError(POSE_PATH)
 
@@ -185,16 +169,13 @@ def pose_worker():
         print("[Pose] Classes:", model.names)
 
     except Exception as error:
-
         update_status("pose", f"ERROR: {error}")
-
         print("[Pose ERROR]", error)
         return
 
     while not stop_event.is_set():
 
         try:
-
             frame, timestamp, submitted_at = (
                 pose_queue.get(timeout=0.2)
             )
@@ -203,7 +184,6 @@ def pose_worker():
             continue
 
         try:
-
             with torch.inference_mode():
 
                 prediction = model.predict(
@@ -222,7 +202,6 @@ def pose_worker():
             keypoints = None
 
             if prediction.keypoints is not None:
-
                 keypoints = (
                     prediction.keypoints.data
                     .cpu()
@@ -240,7 +219,6 @@ def pose_worker():
             update_result("pose", result)
 
         except Exception as error:
-
             print("[Pose ERROR]", error)
 
 
@@ -251,11 +229,9 @@ def pose_worker():
 def weapon_worker():
 
     try:
-
         if not WEAPON_PATH.exists():
             raise FileNotFoundError(WEAPON_PATH)
 
-        # Your Kaggle notebook uses YOLO()
         model = YOLO(str(WEAPON_PATH))
 
         update_status("weapon", "Running")
@@ -264,16 +240,13 @@ def weapon_worker():
         print("[Weapon] Classes:", model.names)
 
     except Exception as error:
-
         update_status("weapon", f"ERROR: {error}")
-
         print("[Weapon ERROR]", error)
         return
 
     while not stop_event.is_set():
 
         try:
-
             frame, timestamp, submitted_at = (
                 weapon_queue.get(timeout=0.2)
             )
@@ -282,7 +255,6 @@ def weapon_worker():
             continue
 
         try:
-
             with torch.inference_mode():
 
                 prediction = model.predict(
@@ -298,6 +270,7 @@ def weapon_worker():
 
                 boxes = prediction.boxes.xyxy.cpu().numpy()
                 confidences = prediction.boxes.conf.cpu().numpy()
+
                 class_ids = (
                     prediction.boxes.cls.cpu()
                     .numpy()
@@ -326,7 +299,6 @@ def weapon_worker():
             update_result("weapon", result)
 
         except Exception as error:
-
             print("[Weapon ERROR]", error)
 
 
@@ -353,6 +325,7 @@ workers = [
         name="Weapon",
         daemon=True
     )
+
 ]
 
 
@@ -367,15 +340,6 @@ def start_workers():
 # =====================================================
 
 def create_timesformer_clip(frame_buffer, now):
-
-    """
-    Select 8 evenly spaced frames from the
-    latest 5 seconds of camera footage.
-
-    Stored frames are BGR and already resized
-    to 224 x 224. The adapter performs RGB
-    conversion and normalization.
-    """
 
     start_time = now - TIMESFORMER_CLIP_SECONDS
 
@@ -407,96 +371,13 @@ def create_timesformer_clip(frame_buffer, now):
             )
         )
 
-        selected.append(
-            entries[index][1]
-        )
+        selected.append(entries[index][1])
 
     return np.stack(selected)
 
 
 # =====================================================
-# 10. INCIDENT LOGGING
-# =====================================================
-
-last_alert_time = 0
-
-
-def save_incident(results):
-
-    global last_alert_time
-
-    now = time.monotonic()
-
-    if now - last_alert_time < ALERT_COOLDOWN:
-        return
-
-    ts = results["timesformer"]
-    weapon = results["weapon"]
-
-    # Independent TimeSformer result
-    violence_event = (
-
-        ts is not None
-
-        and ts["prediction"] in ["Fighting", "Shooting"]
-
-        and now - ts["wall_time"] <= RESULT_MAX_AGE
-    )
-
-    # Independent weapon result
-    weapon_event = (
-
-        weapon is not None
-
-        and weapon["weapon_detected"]
-
-        and now - weapon["wall_time"] <= RESULT_MAX_AGE
-    )
-
-    if not violence_event and not weapon_event:
-        return
-
-    incident = {
-
-        "timestamp": datetime.now().isoformat(
-            timespec="seconds"
-        ),
-
-        "timesformer_result": ts,
-
-        "pose_result": results["pose"],
-
-        "weapon_result": weapon,
-
-        "event_types": {
-            "timesformer_violence_prediction": violence_event,
-            "weapon_detection": weapon_event
-        }
-
-    }
-
-    filename = INCIDENT_DIR / (
-        datetime.now().strftime(
-            "incident_%Y%m%d_%H%M%S_%f.json"
-        )
-    )
-
-    with open(filename, "w") as file:
-
-        json.dump(
-            incident,
-            file,
-            indent=4
-        )
-
-    last_alert_time = now
-
-    print("\nATTENTION EVENT RECORDED")
-    print("Saved:", filename)
-
-
-# =====================================================
-# 11. DISPLAY ALL THREE MODEL RESULTS
+# 10. DISPLAY ALL THREE MODEL RESULTS
 # =====================================================
 
 def draw_results(frame, results, statuses):
@@ -585,7 +466,6 @@ def draw_results(frame, results, statuses):
             text += " [STALE]"
 
     else:
-
         text = "YOLO Pose: Waiting"
 
     cv2.putText(
@@ -608,9 +488,7 @@ def draw_results(frame, results, statuses):
 
         detections = weapon["detections"]
 
-        text = (
-            f"Weapon detections: {len(detections)}"
-        )
+        text = f"Weapon detections: {len(detections)}"
 
         if time.monotonic() - weapon["wall_time"] > RESULT_MAX_AGE:
             text += " [STALE]"
@@ -691,6 +569,88 @@ def draw_results(frame, results, statuses):
 
 
 # =====================================================
+# 11. ALERT AND INCIDENT SUMMARIZATION
+# =====================================================
+
+def process_alerts(
+    alert_manager,
+    frame,
+    results,
+    last_evaluated
+):
+
+    ts = results["timesformer"]
+    weapon = results["weapon"]
+    pose = results["pose"]
+
+    if ts is None or weapon is None:
+        return
+
+    now = time.monotonic()
+
+    # Check whether both model results are recent.
+
+    timesformer_fresh = (
+        now - ts["wall_time"] <= RESULT_MAX_AGE
+    )
+
+    weapon_fresh = (
+        now - weapon["wall_time"] <= RESULT_MAX_AGE
+    )
+
+    if not timesformer_fresh or not weapon_fresh:
+        return
+
+    # Do not count the same cached predictions repeatedly.
+    # Evaluate only when both models have produced new results.
+
+    new_timesformer_result = (
+        ts["wall_time"] != last_evaluated["timesformer"]
+    )
+
+    new_weapon_result = (
+        weapon["wall_time"] != last_evaluated["weapon"]
+    )
+
+    if not new_timesformer_result or not new_weapon_result:
+        return
+
+    last_evaluated["timesformer"] = ts["wall_time"]
+    last_evaluated["weapon"] = weapon["wall_time"]
+
+    # Adapt TimeSformer output to AlertManager's expected format.
+
+    timesformer_result = {
+        "class_name": ts["prediction"],
+        "confidence": ts["confidence"],
+        "violence_probability": ts["violence_probability"],
+        "probabilities": ts["probabilities"]
+    }
+
+    # Weapon worker already produces normalized dictionaries.
+
+    weapon_detections = weapon["detections"]
+
+    # Pose output is supporting information only.
+
+    people_count = (
+        pose["people_detected"]
+        if pose is not None
+        and now - pose["wall_time"] <= RESULT_MAX_AGE
+        else 0
+    )
+
+    # Generate alerts and incident summaries.
+
+    alert_manager.check_alert(
+        frame=frame,
+        timesformer_result=timesformer_result,
+        weapon_detections=weapon_detections,
+        people_count=people_count
+    )
+
+
+# =====================================================
 # 12. MAIN CAMERA LOOP
 # =====================================================
 
@@ -704,16 +664,26 @@ def main():
 
     cap = open_camera()
 
-    # Keep a lightweight 5-second frame buffer.
-    # Only 224x224 frames are stored for TimeSformer.
     frame_buffer = deque()
 
     last_timesformer_time = 0
     last_detection_time = 0
 
+    # Initialize alert manager once.
+
+    alert_manager = AlertManager()
+
+    # Track which results have already been evaluated.
+
+    last_evaluated = {
+        "timesformer": None,
+        "weapon": None
+    }
+
     print("\n======================================")
     print("REAL-TIME PARALLEL SYSTEM STARTED")
     print("TimeSformer | YOLO Pose | YOLO Weapon")
+    print("Alert and incident summarization enabled")
     print("Press Q to stop")
     print("======================================")
 
@@ -734,7 +704,7 @@ def main():
             )
 
             # =====================================
-            # A. SAVE LIGHTWEIGHT TIMESFORMER FRAME
+            # A. SAVE TIMESFORMER FRAME
             # =====================================
 
             small_frame = cv2.resize(
@@ -746,13 +716,11 @@ def main():
                 (now, small_frame)
             )
 
-            # Remove frames older than 5 seconds
             while (
                 frame_buffer
                 and now - frame_buffer[0][0]
                 > TIMESFORMER_CLIP_SECONDS + 0.5
             ):
-
                 frame_buffer.popleft()
 
             # =====================================
@@ -819,10 +787,15 @@ def main():
             results, statuses = get_results()
 
             # =====================================
-            # E. INCIDENT LOGGING
+            # E. ALERT + INCIDENT SUMMARIZATION
             # =====================================
 
-            save_incident(results)
+            process_alerts(
+                alert_manager,
+                frame,
+                results,
+                last_evaluated
+            )
 
             # =====================================
             # F. DISPLAY
@@ -861,5 +834,4 @@ def main():
 # =====================================================
 
 if __name__ == "__main__":
-
     main()
