@@ -1,0 +1,9 @@
+
+torch==2.8.0
+torchvision
+transformers
+ultralytics
+opencv-python==4.10.0.84
+numpy
+pillow
+pygrabber
