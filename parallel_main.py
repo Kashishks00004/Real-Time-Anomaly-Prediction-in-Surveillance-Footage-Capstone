@@ -1,8 +1,6 @@
-
 import cv2
 import torch
 import time
-import json
 import queue
 import threading
 import numpy as np
@@ -61,7 +59,6 @@ weapon_queue = queue.Queue(maxsize=1)
 def put_latest(q, item):
     try:
         q.put_nowait(item)
-
     except queue.Full:
         try:
             q.get_nowait()
@@ -90,10 +87,7 @@ def update_status(name, status):
 
 def get_results():
     with results_lock:
-        return (
-            dict(latest_results),
-            dict(model_status)
-        )
+        return dict(latest_results), dict(model_status)
 
 
 # =====================================================
@@ -101,12 +95,9 @@ def get_results():
 # =====================================================
 
 def timesformer_worker():
-
     try:
         model = TimeSformerAdapter()
-
         update_status("timesformer", "Running")
-
         print("[TimeSformer] Worker started.")
 
     except Exception as error:
@@ -120,7 +111,6 @@ def timesformer_worker():
             clip, timestamp, submitted_at = (
                 timesformer_queue.get(timeout=0.2)
             )
-
         except queue.Empty:
             continue
 
@@ -132,10 +122,10 @@ def timesformer_worker():
                 "wall_time": submitted_at,
                 "prediction": prediction["class_name"],
                 "predicted_class": prediction["predicted_class"],
-                "confidence": prediction["confidence"],
-                "violence_probability": prediction[
-                    "violence_probability"
-                ],
+                "confidence": float(prediction["confidence"]),
+                "violence_probability": float(
+                    prediction["violence_probability"]
+                ),
                 "probabilities": prediction["probabilities"]
             }
 
@@ -152,11 +142,10 @@ def timesformer_worker():
 
 
 # =====================================================
-# 6. POSE WORKER
+# 6. YOLO POSE WORKER
 # =====================================================
 
 def pose_worker():
-
     try:
         if not POSE_PATH.exists():
             raise FileNotFoundError(POSE_PATH)
@@ -179,7 +168,6 @@ def pose_worker():
             frame, timestamp, submitted_at = (
                 pose_queue.get(timeout=0.2)
             )
-
         except queue.Empty:
             continue
 
@@ -199,20 +187,25 @@ def pose_worker():
                 else 0
             )
 
+            person_boxes = []
+
+            if prediction.boxes is not None:
+                person_boxes = (
+                    prediction.boxes.xyxy.cpu().numpy().tolist()
+                )
+
             keypoints = None
 
             if prediction.keypoints is not None:
                 keypoints = (
-                    prediction.keypoints.data
-                    .cpu()
-                    .numpy()
-                    .tolist()
+                    prediction.keypoints.data.cpu().numpy().tolist()
                 )
 
             result = {
                 "timestamp": timestamp,
                 "wall_time": submitted_at,
                 "people_detected": people_count,
+                "person_boxes": person_boxes,
                 "keypoints": keypoints
             }
 
@@ -223,11 +216,10 @@ def pose_worker():
 
 
 # =====================================================
-# 7. WEAPON WORKER
+# 7. YOLO WEAPON WORKER
 # =====================================================
 
 def weapon_worker():
-
     try:
         if not WEAPON_PATH.exists():
             raise FileNotFoundError(WEAPON_PATH)
@@ -250,7 +242,6 @@ def weapon_worker():
             frame, timestamp, submitted_at = (
                 weapon_queue.get(timeout=0.2)
             )
-
         except queue.Empty:
             continue
 
@@ -272,9 +263,7 @@ def weapon_worker():
                 confidences = prediction.boxes.conf.cpu().numpy()
 
                 class_ids = (
-                    prediction.boxes.cls.cpu()
-                    .numpy()
-                    .astype(int)
+                    prediction.boxes.cls.cpu().numpy().astype(int)
                 )
 
                 for box, confidence, class_id in zip(
@@ -292,7 +281,7 @@ def weapon_worker():
             result = {
                 "timestamp": timestamp,
                 "wall_time": submitted_at,
-                "weapon_detected": len(detections) > 0,
+                "weapon_detected": bool(detections),
                 "detections": detections
             }
 
@@ -303,11 +292,10 @@ def weapon_worker():
 
 
 # =====================================================
-# 8. START THREE WORKERS
+# 8. START THREE INDEPENDENT WORKERS
 # =====================================================
 
 workers = [
-
     threading.Thread(
         target=timesformer_worker,
         name="TimeSformer",
@@ -325,12 +313,10 @@ workers = [
         name="Weapon",
         daemon=True
     )
-
 ]
 
 
 def start_workers():
-
     for worker in workers:
         worker.start()
 
@@ -366,9 +352,7 @@ def create_timesformer_clip(frame_buffer, now):
     for target in target_times:
 
         index = int(
-            np.argmin(
-                np.abs(frame_times - target)
-            )
+            np.argmin(np.abs(frame_times - target))
         )
 
         selected.append(entries[index][1])
@@ -377,7 +361,114 @@ def create_timesformer_clip(frame_buffer, now):
 
 
 # =====================================================
-# 10. DISPLAY ALL THREE MODEL RESULTS
+# 10. DRAW HUMAN POSE
+# Assumes standard COCO 17-keypoint YOLO pose output.
+# =====================================================
+
+POSE_CONNECTIONS = [
+    (5, 6),
+
+    (5, 7),
+    (7, 9),
+
+    (6, 8),
+    (8, 10),
+
+    (5, 11),
+    (6, 12),
+
+    (11, 12),
+
+    (11, 13),
+    (13, 15),
+
+    (12, 14),
+    (14, 16)
+]
+
+
+def draw_pose(display, pose):
+
+    if not pose:
+        return display
+
+    # Draw person bounding boxes
+
+    for box in pose.get("person_boxes", []):
+
+        x1, y1, x2, y2 = map(int, box)
+
+        cv2.rectangle(
+            display,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            2
+        )
+
+        cv2.putText(
+            display,
+            "Person",
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 0),
+            2
+        )
+
+    # Draw skeleton keypoints
+
+    all_keypoints = pose.get("keypoints")
+
+    if all_keypoints is None:
+        return display
+
+    for person in all_keypoints:
+
+        visible = {}
+
+        for index, point in enumerate(person):
+
+            x = int(point[0])
+            y = int(point[1])
+
+            confidence = (
+                float(point[2])
+                if len(point) > 2
+                else 1.0
+            )
+
+            if confidence >= 0.25:
+
+                visible[index] = (x, y)
+
+                cv2.circle(
+                    display,
+                    (x, y),
+                    4,
+                    (0, 255, 255),
+                    -1
+                )
+
+        # Draw skeleton connections
+
+        for start, end in POSE_CONNECTIONS:
+
+            if start in visible and end in visible:
+
+                cv2.line(
+                    display,
+                    visible[start],
+                    visible[end],
+                    (255, 0, 255),
+                    2
+                )
+
+    return display
+
+
+# =====================================================
+# 11. DISPLAY ALL THREE MODEL RESULTS
 # =====================================================
 
 def draw_results(frame, results, statuses):
@@ -394,9 +485,9 @@ def draw_results(frame, results, statuses):
         2
     )
 
-    # -----------------------------------------
-    # TIMESFORMER
-    # -----------------------------------------
+    # -----------------------------
+    # TimeSformer results
+    # -----------------------------
 
     ts = results["timesformer"]
 
@@ -450,27 +541,33 @@ def draw_results(frame, results, statuses):
             2
         )
 
-    # -----------------------------------------
-    # POSE
-    # -----------------------------------------
+    # -----------------------------
+    # YOLO Pose results
+    # -----------------------------
 
     pose = results["pose"]
 
     if pose:
 
-        text = (
+        pose_text = (
             f"YOLO Pose: {pose['people_detected']} people"
         )
 
-        if time.monotonic() - pose["wall_time"] > RESULT_MAX_AGE:
-            text += " [STALE]"
+        if (
+            time.monotonic() - pose["wall_time"]
+            > RESULT_MAX_AGE
+        ):
+            pose_text += " [STALE]"
+
+        draw_pose(display, pose)
 
     else:
-        text = "YOLO Pose: Waiting"
+
+        pose_text = "YOLO Pose: Waiting"
 
     cv2.putText(
         display,
-        text,
+        pose_text,
         (20, 140),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -478,9 +575,9 @@ def draw_results(frame, results, statuses):
         2
     )
 
-    # -----------------------------------------
-    # WEAPON
-    # -----------------------------------------
+    # -----------------------------
+    # YOLO Weapon results
+    # -----------------------------
 
     weapon = results["weapon"]
 
@@ -488,14 +585,19 @@ def draw_results(frame, results, statuses):
 
         detections = weapon["detections"]
 
-        text = f"Weapon detections: {len(detections)}"
+        weapon_text = (
+            f"Weapon detections: {len(detections)}"
+        )
 
-        if time.monotonic() - weapon["wall_time"] > RESULT_MAX_AGE:
-            text += " [STALE]"
+        if (
+            time.monotonic() - weapon["wall_time"]
+            > RESULT_MAX_AGE
+        ):
+            weapon_text += " [STALE]"
 
         cv2.putText(
             display,
-            text,
+            weapon_text,
             (20, 175),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -545,9 +647,9 @@ def draw_results(frame, results, statuses):
             2
         )
 
-    # -----------------------------------------
-    # MODEL STATUS
-    # -----------------------------------------
+    # -----------------------------
+    # Model status
+    # -----------------------------
 
     y = 220
 
@@ -569,7 +671,7 @@ def draw_results(frame, results, statuses):
 
 
 # =====================================================
-# 11. ALERT AND INCIDENT SUMMARIZATION
+# 12. ALERT + INCIDENT SUMMARIZATION
 # =====================================================
 
 def process_alerts(
@@ -588,37 +690,27 @@ def process_alerts(
 
     now = time.monotonic()
 
-    # Check whether both model results are recent.
+    # Check whether both results are recent
 
-    timesformer_fresh = (
-        now - ts["wall_time"] <= RESULT_MAX_AGE
-    )
-
-    weapon_fresh = (
-        now - weapon["wall_time"] <= RESULT_MAX_AGE
-    )
-
-    if not timesformer_fresh or not weapon_fresh:
+    if now - ts["wall_time"] > RESULT_MAX_AGE:
         return
 
-    # Do not count the same cached predictions repeatedly.
-    # Evaluate only when both models have produced new results.
-
-    new_timesformer_result = (
-        ts["wall_time"] != last_evaluated["timesformer"]
-    )
-
-    new_weapon_result = (
-        weapon["wall_time"] != last_evaluated["weapon"]
-    )
-
-    if not new_timesformer_result or not new_weapon_result:
+    if now - weapon["wall_time"] > RESULT_MAX_AGE:
         return
 
-    last_evaluated["timesformer"] = ts["wall_time"]
-    last_evaluated["weapon"] = weapon["wall_time"]
+    # Evaluate only when either model has a new result
 
-    # Adapt TimeSformer output to AlertManager's expected format.
+    current_pair = (
+        ts["wall_time"],
+        weapon["wall_time"]
+    )
+
+    if current_pair == last_evaluated["pair"]:
+        return
+
+    last_evaluated["pair"] = current_pair
+
+    # Convert TimeSformer result to AlertManager format
 
     timesformer_result = {
         "class_name": ts["prediction"],
@@ -627,20 +719,20 @@ def process_alerts(
         "probabilities": ts["probabilities"]
     }
 
-    # Weapon worker already produces normalized dictionaries.
+    # Weapon detections are already normalized
 
     weapon_detections = weapon["detections"]
 
-    # Pose output is supporting information only.
+    # Pose is supporting information only
 
-    people_count = (
-        pose["people_detected"]
-        if pose is not None
+    people_count = 0
+
+    if (
+        pose is not None
         and now - pose["wall_time"] <= RESULT_MAX_AGE
-        else 0
-    )
+    ):
 
-    # Generate alerts and incident summaries.
+        people_count = pose["people_detected"]
 
     alert_manager.check_alert(
         frame=frame,
@@ -651,7 +743,7 @@ def process_alerts(
 
 
 # =====================================================
-# 12. MAIN CAMERA LOOP
+# 13. MAIN CAMERA LOOP
 # =====================================================
 
 def main():
@@ -669,21 +761,17 @@ def main():
     last_timesformer_time = 0
     last_detection_time = 0
 
-    # Initialize alert manager once.
-
     alert_manager = AlertManager()
 
-    # Track which results have already been evaluated.
-
     last_evaluated = {
-        "timesformer": None,
-        "weapon": None
+        "pair": None
     }
 
     print("\n======================================")
     print("REAL-TIME PARALLEL SYSTEM STARTED")
     print("TimeSformer | YOLO Pose | YOLO Weapon")
-    print("Alert and incident summarization enabled")
+    print("Pose skeleton + bounding boxes enabled")
+    print("Alerts + incident summarization enabled")
     print("Press Q to stop")
     print("======================================")
 
@@ -694,6 +782,7 @@ def main():
             ret, frame = cap.read()
 
             if not ret or frame is None:
+
                 print("Camera frame unavailable.")
                 break
 
@@ -703,9 +792,9 @@ def main():
                 timespec="milliseconds"
             )
 
-            # =====================================
-            # A. SAVE TIMESFORMER FRAME
-            # =====================================
+            # ---------------------------------
+            # A. TimeSformer frame buffer
+            # ---------------------------------
 
             small_frame = cv2.resize(
                 frame,
@@ -721,16 +810,19 @@ def main():
                 and now - frame_buffer[0][0]
                 > TIMESFORMER_CLIP_SECONDS + 0.5
             ):
+
                 frame_buffer.popleft()
 
-            # =====================================
-            # B. TIMESFORMER PROCESSING
-            # =====================================
+            # ---------------------------------
+            # B. TimeSformer clip submission
+            # ---------------------------------
 
             if (
                 now - last_timesformer_time
                 >= TIMESFORMER_STRIDE_SECONDS
+
                 and frame_buffer
+
                 and now - frame_buffer[0][0]
                 >= TIMESFORMER_CLIP_SECONDS
             ):
@@ -744,18 +836,14 @@ def main():
 
                     put_latest(
                         timesformer_queue,
-                        (
-                            clip,
-                            timestamp,
-                            now
-                        )
+                        (clip, timestamp, now)
                     )
 
                     last_timesformer_time = now
 
-            # =====================================
-            # C. POSE + WEAPON PROCESSING
-            # =====================================
+            # ---------------------------------
+            # C. Pose and weapon submission
+            # ---------------------------------
 
             if (
                 now - last_detection_time
@@ -780,15 +868,15 @@ def main():
 
                 last_detection_time = now
 
-            # =====================================
-            # D. COLLECT RESULTS
-            # =====================================
+            # ---------------------------------
+            # D. Collect latest results
+            # ---------------------------------
 
             results, statuses = get_results()
 
-            # =====================================
-            # E. ALERT + INCIDENT SUMMARIZATION
-            # =====================================
+            # ---------------------------------
+            # E. Alerts and incident summaries
+            # ---------------------------------
 
             process_alerts(
                 alert_manager,
@@ -797,9 +885,9 @@ def main():
                 last_evaluated
             )
 
-            # =====================================
-            # F. DISPLAY
-            # =====================================
+            # ---------------------------------
+            # F. Display results
+            # ---------------------------------
 
             display = draw_results(
                 frame,
@@ -820,7 +908,6 @@ def main():
         stop_event.set()
 
         cap.release()
-
         cv2.destroyAllWindows()
 
         for worker in workers:
@@ -830,7 +917,7 @@ def main():
 
 
 # =====================================================
-# 13. EXECUTION
+# 14. EXECUTION
 # =====================================================
 
 if __name__ == "__main__":

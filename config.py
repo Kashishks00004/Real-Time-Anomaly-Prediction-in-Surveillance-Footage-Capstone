@@ -61,7 +61,7 @@ TIMESFORMER_LABELS = {
 # ==========================================
 
 POSE_CONFIDENCE = 0.25
-WEAPON_CONFIDENCE = 0.50
+WEAPON_CONFIDENCE = 0.70
 
 # Initial threshold; validate it using your test videos.
 VIOLENCE_THRESHOLD = 0.65
