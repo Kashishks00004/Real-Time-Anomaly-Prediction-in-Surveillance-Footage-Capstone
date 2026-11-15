@@ -1,75 +1,292 @@
 
-import time
 import cv2
+import json
+import time
+import threading
+import winsound
 
-from config import (
-    SCREENSHOT_DIR,
-    VIOLENCE_THRESHOLD,
-    WEAPON_CONFIDENCE,
-    ALERT_COOLDOWN,
-    ALERT_CONFIRMATION_COUNT,
-    SAVE_INCIDENT_SCREENSHOT
-)
+from pathlib import Path
+from datetime import datetime
+from llm_summarizer import generate_incident_summary
 
-from incident_summarizer import save_incident_report
+# ==========================================
+# ALERT SETTINGS
+# ==========================================
 
-def normalize_weapon_results(yolo_results, confidence_threshold=0.50):
-    """
-    Convert Ultralytics YOLO/RT-DETR results into
-    the format expected by AlertManager.
-    """
+try:
+    from config import (
+        OUTPUT_DIR,
+        INCIDENT_DIR,
+        SCREENSHOT_DIR,
+        VIOLENCE_THRESHOLD,
+        WEAPON_CONFIDENCE,
+        ALERT_COOLDOWN,
+        ALERT_CONFIRMATION_COUNT,
+        SAVE_INCIDENT_SCREENSHOT
+    )
+except ImportError:
+    OUTPUT_DIR = Path("outputs")
+    INCIDENT_DIR = OUTPUT_DIR / "incidents"
+    SCREENSHOT_DIR = OUTPUT_DIR / "screenshots"
 
-    detections = []
+    VIOLENCE_THRESHOLD = 0.65
+    WEAPON_CONFIDENCE = 0.50
+    ALERT_COOLDOWN = 5.0
+    ALERT_CONFIRMATION_COUNT = 2
+    SAVE_INCIDENT_SCREENSHOT = True
 
-    if not yolo_results:
-        return detections
-
-    result = yolo_results[0]
-    boxes = result.boxes
-
-    if boxes is None:
-        return detections
-
-    for box in boxes:
-        confidence = float(box.conf[0].item())
-
-        if confidence < confidence_threshold:
-            continue
-
-        class_id = int(box.cls[0].item())
-        class_name = result.names[class_id]
-
-        detections.append({
-            "class_name": str(class_name),
-            "confidence": confidence
-        })
-
-    return detections
+INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def normalize_pose_people_count(pose_results):
-    """
-    Estimate the number of people from YOLO Pose detections.
-    """
-
-    if not pose_results:
-        return 0
-
-    result = pose_results[0]
-
-    if result.boxes is None:
-        return 0
-
-    return len(result.boxes)
-
+# ==========================================
+# ALERT MANAGER
+# ==========================================
 
 class AlertManager:
 
     def __init__(self):
-        self.last_alert_time = 0.0
+        self.last_alert_time = 0
 
         self.violence_count = 0
         self.weapon_count = 0
+
+        self.current_alert = None
+        self.alert_expiry = 0
+
+        # Latest incident information for screen display
+        self.latest_incident = None
+
+        self.sound_stop_event = threading.Event()
+        self.lock = threading.Lock()
+
+    # ======================================
+    # SOUND ALERT
+    # ======================================
+
+    def play_sound(self, severity):
+
+        self.sound_stop_event.clear()
+
+        def sound_worker():
+            try:
+                if severity == "CRITICAL":
+                    pattern = [
+                        (1500, 300), (1000, 300),
+                        (1500, 300), (1000, 300)
+                    ]
+                elif severity == "HIGH":
+                    pattern = [
+                        (1200, 350), (1200, 350),
+                        (1200, 350)
+                    ]
+                else:
+                    pattern = [(800, 400), (800, 400)]
+
+                for frequency, duration in pattern:
+                    if self.sound_stop_event.is_set():
+                        break
+
+                    winsound.Beep(frequency, duration)
+
+                    if self.sound_stop_event.wait(0.15):
+                        break
+
+            except Exception as error:
+                print("Sound alert error:", error)
+
+        threading.Thread(
+            target=sound_worker,
+            daemon=True
+        ).start()
+
+    # ======================================
+    # SILENCE SOUND
+    # ======================================
+
+    def acknowledge(self):
+        self.sound_stop_event.set()
+        print("[INFO] Alert sound acknowledged.")
+
+    # ======================================
+    # GET ACTIVE ALERT
+    # ======================================
+
+    def get_active_alert(self):
+
+        with self.lock:
+            if time.time() <= self.alert_expiry:
+                return self.current_alert.copy() if self.current_alert else None
+
+            return None
+
+    # ======================================
+    # GET LATEST INCIDENT FOR SCREEN
+    # ======================================
+
+    def get_latest_incident(self):
+
+        with self.lock:
+            if self.latest_incident is None:
+                return None
+
+            return self.latest_incident.copy()
+
+    # ======================================
+    # SAVE INCIDENT AND GENERATE SUMMARY
+    # ======================================
+
+    def save_incident(
+        self,
+        frame,
+        alert_type,
+        severity,
+        timesformer_result,
+        weapon_detections,
+        people_count
+    ):
+
+        timestamp = datetime.now()
+
+        incident_id = timestamp.strftime(
+            "INC_%Y%m%d_%H%M%S_%f"
+        )
+
+        screenshot_path = None
+
+        if SAVE_INCIDENT_SCREENSHOT and frame is not None:
+            screenshot_path = SCREENSHOT_DIR / f"{incident_id}.jpg"
+            cv2.imwrite(str(screenshot_path), frame)
+
+        report_path = INCIDENT_DIR / f"{incident_id}.json"
+
+        incident_report = {
+            "incident_id": incident_id,
+            "timestamp": timestamp.isoformat(),
+            "incident_type": alert_type,
+            "severity": severity,
+            "timesformer": timesformer_result,
+            "weapon_detections": weapon_detections,
+            "people_count": people_count,
+            "llm_summary": "Generating AI summary...",
+            "llm_model": "Ollama - qwen2.5:3b",
+            "llm_status": "pending",
+            "screenshot": str(screenshot_path) if screenshot_path else None
+        }
+
+        # Save initial report immediately
+        with open(report_path, "w", encoding="utf-8") as file:
+            json.dump(
+                incident_report,
+                file,
+                indent=4,
+                ensure_ascii=False,
+                default=str
+            )
+
+        # Make incident immediately available to the screen
+        with self.lock:
+            self.latest_incident = {
+                "incident_id": incident_id,
+                "timestamp": timestamp.strftime("%H:%M:%S"),
+                "incident_type": alert_type,
+                "severity": severity,
+                "summary": "Generating AI summary...",
+                "llm_status": "pending",
+                "llm_model": "Ollama - qwen2.5:3b",
+                "violence_classification": timesformer_result.get(
+                    "class_name", "Unavailable"
+                ),
+                "violence_confidence": timesformer_result.get(
+                    "confidence", None
+                ),
+                "violence_probability": timesformer_result.get(
+                    "violence_probability", None
+                ),
+                "weapon_detections": weapon_detections,
+                "people_count": people_count,
+                "screenshot": str(screenshot_path) if screenshot_path else None
+            }
+
+        # ==================================
+        # BACKGROUND LLM SUMMARY
+        # ==================================
+
+        def generate_summary_in_background():
+
+            try:
+                llm_result = generate_incident_summary(
+                    timesformer_result,
+                    weapon_detections,
+                    people_count,
+                    alert_type,
+                    severity
+                )
+
+                summary = llm_result.get(
+                    "summary",
+                    "Summary could not be generated."
+                )
+
+                method = llm_result.get(
+                    "method",
+                    "Ollama"
+                )
+
+                status = llm_result.get(
+                    "status",
+                    "unknown"
+                )
+
+            except Exception as error:
+                print("[ERROR] LLM summary generation failed:", error)
+
+                summary = "AI summary generation failed. Please review the incident manually."
+                method = "Python fallback"
+                status = "error"
+
+            # Update JSON report
+            incident_report["llm_summary"] = summary
+            incident_report["llm_model"] = method
+            incident_report["llm_status"] = status
+
+            try:
+                with open(report_path, "w", encoding="utf-8") as file:
+                    json.dump(
+                        incident_report,
+                        file,
+                        indent=4,
+                        ensure_ascii=False,
+                        default=str
+                    )
+            except Exception as error:
+                print("[ERROR] Could not update incident report:", error)
+
+            # Update the live screen data
+            with self.lock:
+                if (
+                    self.latest_incident is not None
+                    and self.latest_incident["incident_id"] == incident_id
+                ):
+                    self.latest_incident["summary"] = summary
+                    self.latest_incident["llm_model"] = method
+                    self.latest_incident["llm_status"] = status
+
+            print("\n[INFO] LLM INCIDENT SUMMARY")
+            print(summary)
+            print("[INFO] Updated report:", report_path)
+
+        threading.Thread(
+            target=generate_summary_in_background,
+            daemon=True
+        ).start()
+
+        print("[INFO] Incident report created:", report_path)
+        print("[INFO] LLM summarization running in background.")
+
+    # ======================================
+    # CHECK ALERT CONDITIONS
+    # ======================================
 
     def check_alert(
         self,
@@ -78,58 +295,46 @@ class AlertManager:
         weapon_detections,
         people_count=0
     ):
-        """
-        timesformer_result must contain:
-        predicted_class, class_name, confidence,
-        violence_probability, probabilities
 
-        weapon_detections must be a list of dictionaries.
-        """
+        timesformer_result = timesformer_result or {}
+        weapon_detections = weapon_detections or []
 
-        current_time = time.time()
+        # TimeSformer result
+        class_name = str(
+            timesformer_result.get(
+                "class_name",
+                timesformer_result.get("prediction", "Normal")
+            )
+        ).strip()
 
-        # ======================================
-        # 1. READ TIMESFORMER RESULT
-        # ======================================
-
-        violence_class = timesformer_result.get(
-            "class_name", "Normal"
-        )
-
-        violence_confidence = float(
+        violence_probability = float(
             timesformer_result.get("violence_probability", 0.0)
         )
 
         violence_detected = (
-            violence_class in ("Fighting", "Shooting")
-            and violence_confidence >= VIOLENCE_THRESHOLD
+            class_name.lower() in ["fighting", "shooting"]
+            and violence_probability >= VIOLENCE_THRESHOLD
         )
 
-        # ======================================
-        # 2. CHECK WEAPON DETECTIONS
-        # ======================================
+        # Weapon result
+        valid_weapons = []
 
-        valid_weapons = [
-            item for item in weapon_detections
-            if float(item.get("confidence", 0.0))
-            >= WEAPON_CONFIDENCE
-        ]
+        for detection in weapon_detections:
+            confidence = float(detection.get("confidence", 0))
+
+            if confidence >= WEAPON_CONFIDENCE:
+                valid_weapons.append(detection)
 
         weapon_detected = len(valid_weapons) > 0
 
-        # ======================================
-        # 3. CONFIRM DETECTIONS
-        # ======================================
+        # Confirmation counters
+        self.violence_count = (
+            self.violence_count + 1 if violence_detected else 0
+        )
 
-        if violence_detected:
-            self.violence_count += 1
-        else:
-            self.violence_count = 0
-
-        if weapon_detected:
-            self.weapon_count += 1
-        else:
-            self.weapon_count = 0
+        self.weapon_count = (
+            self.weapon_count + 1 if weapon_detected else 0
+        )
 
         confirmed_violence = (
             self.violence_count >= ALERT_CONFIRMATION_COUNT
@@ -139,68 +344,58 @@ class AlertManager:
             self.weapon_count >= ALERT_CONFIRMATION_COUNT
         )
 
-        if not confirmed_violence and not confirmed_weapon:
+        # Determine incident
+        if confirmed_violence and confirmed_weapon:
+            alert_type = "VIOLENCE AND WEAPON DETECTED"
+            severity = "CRITICAL"
+
+        elif confirmed_violence:
+            alert_type = "VIOLENCE DETECTED"
+            severity = "HIGH"
+
+        elif confirmed_weapon:
+            alert_type = "WEAPON DETECTED"
+            severity = "WARNING"
+
+        else:
             return None
 
-        # ======================================
-        # 4. COOLDOWN
-        # ======================================
+        now = time.time()
 
-        if current_time - self.last_alert_time < ALERT_COOLDOWN:
+        # Cooldown prevents repeated alerts
+        if now - self.last_alert_time < ALERT_COOLDOWN:
             return None
 
-        # ======================================
-        # 5. CAPTURE SCREENSHOT
-        # ======================================
+        self.last_alert_time = now
 
-        screenshot_path = None
+        alert = {
+            "type": alert_type,
+            "severity": severity,
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "violence_probability": violence_probability,
+            "weapon_count": len(valid_weapons),
+            "people_count": people_count
+        }
 
-        if SAVE_INCIDENT_SCREENSHOT and frame is not None:
-            filename = (
-                f"incident_{int(current_time * 1000)}.jpg"
-            )
+        with self.lock:
+            self.current_alert = alert
+            self.alert_expiry = now + 8
 
-            screenshot_path = SCREENSHOT_DIR / filename
+        # Play sound
+        self.play_sound(severity)
 
-            cv2.imwrite(str(screenshot_path), frame)
-
-        # ======================================
-        # 6. CREATE INCIDENT REPORT
-        # ======================================
-
-        report, report_path = save_incident_report(
-            violence_detected=confirmed_violence,
-            violence_class=violence_class,
-            violence_confidence=violence_confidence,
-            weapon_detections=valid_weapons,
-            people_count=people_count,
-            screenshot_path=screenshot_path
+        # Save evidence and start LLM summarization
+        self.save_incident(
+            frame,
+            alert_type,
+            severity,
+            timesformer_result,
+            valid_weapons,
+            people_count
         )
 
-        self.last_alert_time = current_time
-
-        # Reset counters after recording an incident.
+        # Reset counters
         self.violence_count = 0
         self.weapon_count = 0
 
-        # ======================================
-        # 7. DISPLAY ALERT
-        # ======================================
-
-        print("\n" + "=" * 55)
-        print("             SECURITY INCIDENT ALERT")
-        print("=" * 55)
-
-        print("Incident ID:", report["incident_id"])
-        print("Severity:", report["severity"])
-        print("Incident:", report["incident_type"])
-        print("Summary:", report["summary"])
-
-        print("Report saved:", report_path)
-
-        if screenshot_path:
-            print("Screenshot saved:", screenshot_path)
-
-        print("=" * 55 + "\n")
-
-        return report
+        return alert
