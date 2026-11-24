@@ -61,10 +61,12 @@ TIMESFORMER_LABELS = {
 # ==========================================
 
 POSE_CONFIDENCE = 0.25
-WEAPON_CONFIDENCE = 0.70
+WEAPON_CONFIDENCE = 0.80
+WEAPON_CONFIRMATION_COUNT = 3
+ALERT_CONFIRMATION_COUNT = 2
 
 # Initial threshold; validate it using your test videos.
-VIOLENCE_THRESHOLD = 0.65
+VIOLENCE_THRESHOLD = 0.40
 
 # ==========================================
 # INFERENCE SCHEDULING
